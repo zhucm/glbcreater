@@ -1,0 +1,9 @@
+{
+  "source": "cakerdesign/tools",
+  "sha256": {
+    "image-to-model.py": "ece71158419ed85efe0586de25b23cafaa649f8de8884cf32455e205a98022a1",
+    "model-colors.py": "8f028cde4d67597827c5106f39df53abd189985aaf6df380499d2a257f921c1e",
+    "model-curves.py": "bc642bdb138e4f7225fefa97b4196e9270cb600bc7fec7966ce0d23778fa52ae"
+  },
+  "note": "model.py extracts geometry and Blender execution only; project registration and directory CLI removed."
+}

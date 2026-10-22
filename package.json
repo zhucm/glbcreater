@@ -1,0 +1,13 @@
+{
+  "name": "glbcreater",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "meshoptimizer": "0.22.0",
+    "three": "0.180.0"
+  }
+}
