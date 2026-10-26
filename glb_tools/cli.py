@@ -65,10 +65,12 @@ def convert(image, work, target, thumbnail_target, args, blender, node):
             raise ValueError('Blender thumbnail must be 96x96 RGBA with transparency')
     warning = analysis['analysis'].get('color_warning') or validation.get('color_warning')
     target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open('xb') as destination, (work / 'compressed.glb').open('rb') as source:
-        shutil.copyfileobj(source, destination)
-    with thumbnail_target.open('xb') as destination, thumbnail.open('rb') as source:
-        shutil.copyfileobj(source, destination)
+    for destination_path, source_path in ((target, work / 'compressed.glb'),
+                                          (thumbnail_target, thumbnail)):
+        if args.overwrite or not destination_path.is_file():
+            mode = 'wb' if args.overwrite else 'xb'
+            with destination_path.open(mode) as destination, source_path.open('rb') as source:
+                shutil.copyfileobj(source, destination)
     return 'review' if warning else 'success'
 
 
@@ -82,6 +84,7 @@ def main(argv=None):
     parser.add_argument('--thickness-cm', type=float, default=0.5)
     parser.add_argument('--color', help='optional forced color, e.g. #ee4561 (quote in your shell)')
     parser.add_argument('--recover-cartoon-colors', action='store_true')
+    parser.add_argument('--overwrite', action='store_true', help='replace existing GLBs and thumbnails')
     args = parser.parse_args(argv)
     source, output = args.input.resolve(), args.output.resolve()
     if not source.is_dir():
@@ -113,13 +116,9 @@ def main(argv=None):
         target = output / relative.with_suffix('.glb')
         thumbnail_target = image.with_name(image.stem + '_thumb.png')
         print(f'[{index}/{len(images)}] {relative.as_posix()}', flush=True)
-        if target.exists() or thumbnail_target.exists():
-            if target.is_file() and thumbnail_target.is_file():
-                print('  skipped: completed output already exists', flush=True)
-                counts['skipped'] += 1
-            else:
-                print('  failed: incomplete output already exists', flush=True)
-                counts['failed'] += 1
+        if not args.overwrite and target.is_file() and thumbnail_target.is_file():
+            print('  skipped: completed output already exists (use --overwrite to replace)', flush=True)
+            counts['skipped'] += 1
             continue
         work = (output / '.work' / relative.with_suffix('') /
                 (datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '-' + uuid.uuid4().hex[:8]))

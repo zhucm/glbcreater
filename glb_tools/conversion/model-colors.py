@@ -95,6 +95,17 @@ def _analyze_with_fallbacks(path, color=None, recover_cartoon_colors=False):
                     return result
                 except SkippedInput as error:
                     recovery_error = error
+                try:
+                    result = recover_gradient_palette(path)
+                    result['analysis']['initial_skip_reason'] = initial.reason
+                    result['analysis'].update(cartoon_recovery_rejected=recovery_error.reason,
+                                              cartoon_recovery_message=str(recovery_error))
+                    return result
+                except SkippedInput as error:
+                    gradient_error = error
+                if gradient_error.reason in ('gradient-color-error', 'gradient-fragmented-colors'):
+                    gradient_error.metrics['initial_skip_reason'] = initial.reason
+                    raise gradient_error
             try:
                 result = analyze_dominant_color(path)
             except SkippedInput as vertex_error:
@@ -108,6 +119,10 @@ def _analyze_with_fallbacks(path, color=None, recover_cartoon_colors=False):
                 result['analysis'].update(cartoon_recovery_rejected=recovery_error.reason,
                                           cartoon_recovery_message=str(recovery_error),
                                           cartoon_recovery_metrics=recovery_error.metrics)
+            if recover_cartoon_colors and 'gradient_error' in locals():
+                result['analysis'].update(gradient_recovery_rejected=gradient_error.reason,
+                                          gradient_recovery_message=str(gradient_error),
+                                          gradient_recovery_metrics=gradient_error.metrics)
         result['analysis']['initial_skip_reason'] = initial.reason
         return result
 
@@ -587,7 +602,7 @@ def recover_cartoon_palette(path):
     metrics = dict(cartoon_flat_color_ratio=flat_ratio, cartoon_color_error_ratio=error_ratio,
                    cartoon_ink_error_ratio=ink_error, cartoon_reassigned_pixels=reassigned,
                    cartoon_regions=regions, cartoon_palette=palette)
-    if flat_ratio < .95 or error_ratio > NOISE_BUDGET or ink_error > .03 or regions > 256:
+    if flat_ratio < .90 or error_ratio > NOISE_BUDGET or ink_error > .03 or regions > 512:
         raise SkippedInput('cartoon-color-validation', 'Cartoon recovery failed fill, ink, noise or region validation.', metrics)
     ys, xs = np.where(mask)
     crop = labels[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
@@ -598,6 +613,128 @@ def recover_cartoon_palette(path):
     result.update(palette=palette, labels=grid.tolist(), _source_labels=crop.copy())
     result['analysis'].update(metrics, mode='cartoon-recovered-palette', color_fidelity='palette',
                               palette=palette, color_regions=regions, filled_diagonal_pixels=filled)
+    result['analysis'].pop('dominant_color', None)
+    return result
+
+
+def recover_gradient_palette(path, max_colors=8):
+    """Reduce gradients and soft shadows to a small, supported flat palette."""
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    result = analyze_dominant_color(path)
+    with Image.open(path) as image:
+        rgba = np.array(image.convert('RGBA'))
+    rgb, _, mask, _, _ = _foreground(rgba)
+    number, components, stats, _ = cv2.connectedComponentsWithStats(mask.astype('uint8'), connectivity=4)
+    mask &= np.isin(components, [i for i in range(1, number) if stats[i, cv2.CC_STAT_AREA] >= 4])
+    ys, xs = np.where(mask)
+    if len(xs) < 32:
+        raise SkippedInput('gradient-too-small', 'Not enough foreground pixels for palette recovery.')
+
+    lab = cv2.cvtColor(rgb.astype(np.float32) / 255, cv2.COLOR_RGB2LAB)
+    pixels = lab[mask].astype(np.float32)
+    sample = pixels
+    if len(sample) > 100_000:
+        sample = sample[np.linspace(0, len(sample) - 1, 100_000, dtype=np.int32)]
+    clusters = min(max_colors, len(np.unique(sample, axis=0)))
+    if clusters < 2:
+        raise SkippedInput('gradient-single-color', 'No meaningful second color to preserve.')
+    cv2.setRNGSeed(17)
+    _, assignments, centers = cv2.kmeans(
+        sample, clusters, None,
+        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, .5),
+        2, cv2.KMEANS_PP_CENTERS)
+    sample_counts = np.bincount(assignments.ravel(), minlength=clusters)
+
+    # Combine perceptually close clusters so subtle shadows do not become
+    # separate materials. Keep colors ordered by how much of the image they cover.
+    groups = [{i} for i in range(clusters)]
+    while True:
+        pair = None
+        for left in range(len(groups)):
+            for right in range(left + 1, len(groups)):
+                a = np.average(centers[list(groups[left])], axis=0,
+                               weights=sample_counts[list(groups[left])])
+                b = np.average(centers[list(groups[right])], axis=0,
+                               weights=sample_counts[list(groups[right])])
+                if np.linalg.norm(a - b) < 18:
+                    pair = left, right
+                    break
+            if pair:
+                break
+        if not pair:
+            break
+        left, right = pair
+        groups[left] |= groups.pop(right)
+
+    merged_centers = np.array([
+        np.average(centers[list(group)], axis=0, weights=sample_counts[list(group)])
+        for group in groups
+    ], dtype=np.float32)
+    full_distances = np.sum((pixels[:, None, :] - merged_centers[None, :, :]) ** 2, axis=2)
+    pixel_labels = full_distances.argmin(axis=1).astype(np.int16)
+    counts = np.bincount(pixel_labels, minlength=len(merged_centers))
+    minimum_support = max(16, int(len(pixel_labels) * .005))
+    keep = np.flatnonzero(counts >= minimum_support)
+    if len(keep) < 2:
+        raise SkippedInput('gradient-insufficient-colors', 'Fewer than two stable colors remain after shadow removal.')
+    palette_lab = merged_centers[keep]
+    palette_lab = palette_lab[np.argsort(-counts[keep], kind='stable')]
+    if len(palette_lab) > max_colors:
+        palette_lab = palette_lab[:max_colors]
+    pixel_distances = np.sum((pixels[:, None, :] - palette_lab[None, :, :]) ** 2, axis=2)
+    error = np.sqrt(pixel_distances.min(axis=1))
+    p90, p98 = np.percentile(error, (90, 98))
+    if p90 > 24 or p98 > 42:
+        raise SkippedInput('gradient-color-error', 'A short palette would lose too much source color detail.',
+                           {'palette_lab_error_p90': float(p90), 'palette_lab_error_p98': float(p98)})
+
+    palette = []
+    for color in palette_lab:
+        linear_rgb = cv2.cvtColor(color.reshape(1, 1, 3), cv2.COLOR_LAB2RGB)[0, 0]
+        palette.append(np.rint(np.clip(linear_rgb, 0, 1) * 255).astype(int).tolist())
+    labels = pixel_distances.argmin(axis=1).astype(np.int16)
+    full_labels = np.full(mask.shape, -1, dtype=np.int16)
+    full_labels[mask] = labels
+
+    # Remove tiny quantization flecks by assigning each to its strongest neighbor.
+    reassigned = 0
+    for color in range(len(palette)):
+        parts_count, parts, areas, _ = cv2.connectedComponentsWithStats(
+            np.uint8(full_labels == color), connectivity=4)
+        for part in range(1, parts_count):
+            if areas[part, cv2.CC_STAT_AREA] >= MIN_STABLE_REGION_AREA:
+                continue
+            patch = parts == part
+            border = cv2.dilate(np.uint8(patch), np.ones((3, 3), np.uint8)).astype(bool) & mask & ~patch
+            neighbors, votes = np.unique(full_labels[border], return_counts=True)
+            valid = neighbors >= 0
+            if valid.any():
+                full_labels[patch] = neighbors[valid][np.argmax(votes[valid])]
+                reassigned += int(areas[part, cv2.CC_STAT_AREA])
+
+    regions = sum(cv2.connectedComponents(np.uint8(full_labels == i), connectivity=4)[0] - 1
+                  for i in range(len(palette)))
+    if regions > 512:
+        raise SkippedInput('gradient-fragmented-colors', 'Quantized palette creates too many disconnected regions.',
+                           {'palette_regions': regions, 'palette_size': len(palette)})
+    cropped = full_labels[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    source_labels = cropped.copy()
+    height, width = cropped.shape
+    scale = min(1., MAX_GEOMETRY_DIMENSION / max(width, height))
+    if scale < 1:
+        size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        cropped = cv2.resize(cropped, size, interpolation=cv2.INTER_NEAREST)
+    filled = repair_diagonal_contacts(cropped)
+    result.update(palette=palette, labels=cropped.tolist(), _source_labels=source_labels)
+    result['analysis'].update(
+        mode='gradient-reduced-palette', color_fidelity='reduced-palette', palette=palette,
+        palette_size=len(palette), palette_regions=regions,
+        palette_lab_error_p90=round(float(p90), 3), palette_lab_error_p98=round(float(p98), 3),
+        palette_reassigned_pixels=reassigned, filled_diagonal_pixels=filled,
+        source_geometry_resolution=[width, height], mesh_resolution=[cropped.shape[1], cropped.shape[0]])
     result['analysis'].pop('dominant_color', None)
     return result
 
